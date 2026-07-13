@@ -21,7 +21,7 @@ jobs:
           submodules: recursive
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -29,17 +29,27 @@ jobs:
 
       - name: Decode Keystore
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > pixelpilot.jks
+          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > pixelpilot_raw.jks
+
+      - name: Convert Keystore to Compatible Format
+        run: |
+          keytool -importkeystore \
+            -srckeystore pixelpilot_raw.jks \
+            -srcstorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -destkeystore pixelpilot.jks \
+            -deststorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -deststoretype JKS
 
       - name: Build APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEYSTORE_PATH: ${{ github.workspace }}/pixelpilot.jks
         run: |
-          ./gradlew assembleRelease -Pandroid.injected.signing.store.file=$KEYSTORE_PATH \
-          -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
-          -Pandroid.injected.signing.key.alias=pixelpilot \
-          -Pandroid.injected.signing.key.password=$KEYSTORE_PASSWORD
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=$KEYSTORE_PATH \
+            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
+            -Pandroid.injected.signing.key.alias=pixelpilot \
+            -Pandroid.injected.signing.key.password=$KEYSTORE_PASSWORD
           mv app/build/outputs/apk/release/app-release.apk PixelPilot.apk
 
       - name: Upload Release
