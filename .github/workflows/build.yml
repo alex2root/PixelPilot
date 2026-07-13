@@ -31,32 +31,31 @@ jobs:
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > pixelpilot.jks
           if [ ! -s pixelpilot.jks ]; then
-            echo "ERROR: Decoded keystore file is empty. Check secrets.ANDROID_KEYSTORE in repository/environment settings."
+            echo "ERROR: secrets.ANDROID_KEYSTORE is empty."
             exit 1
           fi
 
-      - name: Convert Keystore to JKS
+      - name: Build Unsigned APK
         run: |
-          keytool -importkeystore \
-            -srckeystore pixelpilot.jks \
-            -srcstorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            -destkeystore pixelpilot_fixed.jks \
-            -deststorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            -deststoretype JKS \
-            -noprompt
-          mv pixelpilot_fixed.jks pixelpilot.jks
+          ./gradlew assembleRelease
 
-      - name: Build APK
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEYSTORE_PATH: ${{ github.workspace }}/pixelpilot.jks
+      - name: Sign APK
         run: |
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=$KEYSTORE_PATH \
-            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
-            -Pandroid.injected.signing.key.alias=pixelpilot \
-            -Pandroid.injected.signing.key.password=$KEYSTORE_PASSWORD
-          mv app/build/outputs/apk/release/app-release.apk PixelPilot.apk
+          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | tail -n 1)
+          $BUILD_TOOLS_DIR/apksigner sign \
+            --ks pixelpilot.jks \
+            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+            --ks-key-alias pixelpilot \
+            --key-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+            --out PixelPilot.apk \
+            app/build/outputs/apk/release/app-release-unsigned.apk || \
+          $BUILD_TOOLS_DIR/apksigner sign \
+            --ks pixelpilot.jks \
+            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+            --ks-key-alias pixelpilot \
+            --key-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+            --out PixelPilot.apk \
+            app/build/outputs/apk/release/app-release.apk
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
