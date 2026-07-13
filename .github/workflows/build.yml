@@ -28,19 +28,23 @@ jobs:
           cache: gradle
 
       - name: Decode Keystore
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > pixelpilot_raw.jks
+          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > pixelpilot.jks
+          if [ ! -s pixelpilot.jks ]; then
+            echo "ERROR: Decoded keystore file is empty. Check secrets.ANDROID_KEYSTORE in repository/environment settings."
+            exit 1
+          fi
 
-      - name: Convert Keystore to Compatible Format
+      - name: Convert Keystore to JKS
         run: |
           keytool -importkeystore \
-            -srckeystore pixelpilot_raw.jks \
+            -srckeystore pixelpilot.jks \
             -srcstorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            -destkeystore pixelpilot.jks \
+            -destkeystore pixelpilot_fixed.jks \
             -deststorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
-            -deststoretype JKS
+            -deststoretype JKS \
+            -noprompt
+          mv pixelpilot_fixed.jks pixelpilot.jks
 
       - name: Build APK
         env:
