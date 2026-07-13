@@ -28,8 +28,10 @@ jobs:
           cache: gradle
 
       - name: Decode Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE }}
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > pixelpilot_raw.jks
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > pixelpilot_raw.jks
 
       - name: Convert Keystore to Compatible Format
         run: |
