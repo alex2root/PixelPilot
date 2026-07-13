@@ -29,33 +29,24 @@ jobs:
 
       - name: Decode Keystore
         run: |
-          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > pixelpilot.jks
-          if [ ! -s pixelpilot.jks ]; then
+          # Сохраняем файл именно как fpv.jks
+          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 -d > fpv.jks
+          if [ ! -s fpv.jks ]; then
             echo "ERROR: secrets.ANDROID_KEYSTORE is empty."
             exit 1
           fi
 
-      - name: Build Unsigned APK
+      - name: Build APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_PATH: ${{ github.workspace }}/fpv.jks
         run: |
-          ./gradlew assembleRelease
-
-      - name: Sign APK
-        run: |
-          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | tail -n 1)
-          $BUILD_TOOLS_DIR/apksigner sign \
-            --ks pixelpilot.jks \
-            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
-            --ks-key-alias pixelpilot \
-            --key-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
-            --out PixelPilot.apk \
-            app/build/outputs/apk/release/app-release-unsigned.apk || \
-          $BUILD_TOOLS_DIR/apksigner sign \
-            --ks pixelpilot.jks \
-            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
-            --ks-key-alias pixelpilot \
-            --key-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
-            --out PixelPilot.apk \
-            app/build/outputs/apk/release/app-release.apk
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=$KEYSTORE_PATH \
+            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
+            -Pandroid.injected.signing.key.alias=pixelpilot \
+            -Pandroid.injected.signing.key.password=$KEYSTORE_PASSWORD
+          mv app/build/outputs/apk/release/app-release.apk PixelPilot.apk
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
