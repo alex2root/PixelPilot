@@ -97,12 +97,18 @@ public class WfbLinkManager extends BroadcastReceiver {
         try {
             filters = UsbDeviceFilter.parseXml(context, R.xml.usb_device_filter);
         } catch (Exception e) {
-            e.printStackTrace();
-            return null;
+            Log.e(TAG, "Unable to parse USB device filter", e);
+            return new HashMap<>();
         }
 
         Map<String, UsbDevice> res = new HashMap<>();
-        for (UsbDevice dev : manager.getDeviceList().values()) {
+        Map<String, UsbDevice> attached = manager.getDeviceList();
+        // "No compatible wifi adapter found." is a common report, and the one thing needed to
+        // act on it - the adapter's vendor and product id - was not obtainable. sysfs is not
+        // readable by the shell on some devices (Horizon OS for one) and dumpsys usb does not
+        // list host devices there either, so the app is the only thing that can report it.
+        Log.i(TAG, "usb devices attached: " + attached.size());
+        for (UsbDevice dev : attached.values()) {
             boolean allowed = false;
             for (UsbDeviceFilter filter : filters) {
                 if (filter.productId == dev.getProductId() && filter.vendorId == dev.getVendorId()) {
@@ -110,6 +116,13 @@ public class WfbLinkManager extends BroadcastReceiver {
                     break;
                 }
             }
+            Log.i(TAG, String.format("  %s  %04X:%04X  %s %s  -> %s",
+                    dev.getDeviceName(),
+                    dev.getVendorId(),
+                    dev.getProductId(),
+                    String.valueOf(dev.getManufacturerName()),
+                    String.valueOf(dev.getProductName()),
+                    allowed ? "supported" : "NOT in usb_device_filter.xml"));
             if (!allowed) {
                 continue;
             }
@@ -120,6 +133,10 @@ public class WfbLinkManager extends BroadcastReceiver {
 
     public synchronized void refreshAdapters() {
         Map<String, UsbDevice> attachedAdapters = getAttachedAdapters();
+        if (attachedAdapters == null) {
+            Log.e(TAG, "Could not read the usb device filter, skipping adapter refresh.");
+            return;
+        }
 
         boolean missingPermissions = false;
         android.hardware.usb.UsbManager usbManager =
@@ -128,8 +145,13 @@ public class WfbLinkManager extends BroadcastReceiver {
             if (!usbManager.hasPermission(entry.getValue())) {
                 binding.tvMessage.setVisibility(View.VISIBLE);
                 binding.tvMessage.setText("No permission for wifi adapter(s) " + entry.getValue().getDeviceName());
+                // Android 14 refuses to deliver a PendingIntent built from an implicit
+                // intent to a runtime registered receiver, so the permission result never
+                // arrives unless the package is set explicitly.
+                Intent permissionIntent = new Intent(WfbLinkManager.ACTION_USB_PERMISSION);
+                permissionIntent.setPackage(context.getPackageName());
                 PendingIntent pendingIntent = PendingIntent.getBroadcast(context, 0,
-                        new Intent(WfbLinkManager.ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE);
+                        permissionIntent, PendingIntent.FLAG_IMMUTABLE);
                 usbManager.requestPermission(entry.getValue(), pendingIntent);
                 missingPermissions = true;
             }
@@ -151,20 +173,31 @@ public class WfbLinkManager extends BroadcastReceiver {
         }
 
         // Starts newly attached adapters.
+        boolean startFailed = false;
         for (Map.Entry<String, UsbDevice> entry : attachedAdapters.entrySet()) {
             if (activeWifiAdapters.containsKey(entry.getKey())) {
                 continue;
             }
-            startAdapter(entry.getValue());
-            activeWifiAdapters.put(entry.getKey(), entry.getValue());
+            // Only track it as active if it actually came up, otherwise a failed adapter
+            // is never retried on the next refresh.
+            if (startAdapter(entry.getValue())) {
+                activeWifiAdapters.put(entry.getKey(), entry.getValue());
+            } else {
+                startFailed = true;
+            }
         }
 
         if (activeWifiAdapters.isEmpty()) {
-            String text = "No compatible wifi adapter found.";
+            // Now that a failed start no longer counts as active, an empty map covers two
+            // different problems, and blaming the filter for both sends people looking in
+            // the wrong place.
+            String text = startFailed
+                    ? "Wifi adapter found but could not be started - see the log."
+                    : "No compatible wifi adapter found.";
             binding.tvMessage.setText(text);
             binding.tvMessage.setVisibility(View.VISIBLE);
 
-            String wifi = VideoActivity.wirelessInfo();
+            String wifi = VideoActivity.wirelessInfo(context);
             if (wifi != null) {
                 String local = "udp://" + wifi + ":5600";
                 binding.wifiMessage.setText(local);
@@ -204,7 +237,10 @@ public class WfbLinkManager extends BroadcastReceiver {
         String text = "Starting wfb-ng channel " + wifiChannel + " with " + String.format(
                 "[%04X", dev.getVendorId()) + ":" + String.format("%04X]", dev.getProductId());
         binding.tvMessage.setText(text);
-        wfbLink.start(wifiChannel, bandWidth.getValue(), dev);
+        if (!wfbLink.start(wifiChannel, bandWidth.getValue(), dev)) {
+            binding.tvMessage.setText("Could not open wifi adapter " + dev.getDeviceName());
+            return false;
+        }
         return true;
     }
 }

@@ -9,7 +9,6 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 
 import androidx.annotation.Nullable;
-import androidx.appcompat.app.AppCompatActivity;
 
 import java.util.Timer;
 import java.util.TimerTask;
@@ -35,7 +34,7 @@ public class VideoPlayer implements IVideoParamsChanged {
     private Timer timer;
 
     // Setup as much as possible without creating the decoder
-    public VideoPlayer(final AppCompatActivity parent) {
+    public VideoPlayer(final Context parent) {
         this.context = parent;
         nativeVideoPlayer = nativeInitialize(context);
     }
@@ -51,6 +50,8 @@ public class VideoPlayer implements IVideoParamsChanged {
     public static native void nativeSetVideoSurface(long nativeInstance, Surface surface, int index);
 
     public static native void nativeSetUdpForwarding(long nativeInstance, String ip, int port, boolean enabled);
+
+    public static native void nativeSetLowLatency(long nativeInstance, boolean enabled);
 
     public static native void nativeStartDvr(long nativeInstance, int fd, int fmp4_enabled);
 
@@ -126,6 +127,15 @@ public class VideoPlayer implements IVideoParamsChanged {
         return timer != null;
     }
 
+    /**
+     * Enable/disable the low latency + realtime priority MediaCodec keys.
+     * Takes effect the next time the decoder is configured.
+     */
+    public void setLowLatency(boolean enabled) {
+        verifyApplicationThread();
+        nativeSetLowLatency(nativeVideoPlayer, enabled);
+    }
+
     public void setUdpForwarding(String ip, int port, boolean enabled) {
         verifyApplicationThread();
         nativeSetUdpForwarding(nativeVideoPlayer, ip, port, enabled);
@@ -183,6 +193,29 @@ public class VideoPlayer implements IVideoParamsChanged {
             public void surfaceDestroyed(SurfaceHolder holder) {
                 Log.d(TAG, "surfaceDestroyed idx: " + index);
                 stopAndRemoveReceiverDecoder(index);
+            }
+        };
+    }
+
+    public android.view.TextureView.SurfaceTextureListener configureTextureView(final int index) {
+        return new android.view.TextureView.SurfaceTextureListener() {
+            @Override
+            public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surfaceTexture, int width, int height) {
+                addAndStartDecoderReceiver(new Surface(surfaceTexture), index);
+            }
+
+            @Override
+            public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture surfaceTexture, int width, int height) {
+            }
+
+            @Override
+            public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surfaceTexture) {
+                stopAndRemoveReceiverDecoder(index);
+                return true;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surfaceTexture) {
             }
         };
     }

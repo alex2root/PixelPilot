@@ -3,6 +3,7 @@ package com.openipc.pixelpilot;
 import android.annotation.SuppressLint;
 import android.app.Dialog;
 import android.content.BroadcastReceiver;
+import android.app.ActivityManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -15,6 +16,7 @@ import android.graphics.Color;
 import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.net.VpnService;
+import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
@@ -22,6 +24,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.text.format.Formatter;
 import android.util.Base64;
 import android.util.DisplayMetrics;
@@ -66,20 +70,34 @@ import com.openipc.wfbngrtl8812.WfbNgLink;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.Locale;
 import java.util.Timer;
 import java.util.TimerTask;
+import android.graphics.Bitmap;
+import android.os.SystemClock;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import android.view.TextureView;
+import android.graphics.SurfaceTexture;
+import android.view.Surface;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 // Most basic implementation of an activity that uses VideoNative to stream a video
 // Into an Android Surface View
@@ -88,7 +106,15 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     private static final String TAG = "pixelpilot";
     private static final int PICK_KEY_REQUEST_CODE = 1;
     private static final int PICK_DVR_REQUEST_CODE = 2;
-    private static WifiManager wifiManager;
+    private static final int PICK_MODEL_REQUEST_CODE = 3;
+    private static final String MODEL_LITE0_FILE = "efficientdet-lite0.tflite";
+    private static final String MODEL_LITE2_FILE = "efficientdet-lite2.tflite";
+    private static final String MODEL_LITE0_URL = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite";
+    private static final String MODEL_LITE2_URL = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite";
+    private static final long MODEL_LITE0_BYTES = 13836895L;
+    private static final long MODEL_LITE2_BYTES = 23096891L;
+    private static final String PREF_OD_CUSTOM_MODEL_URI = "od_custom_model_uri";
+    private static final String PREF_OD_CUSTOM_MODEL_NAME = "od_custom_model_name";
     final Handler handler = new Handler(Looper.getMainLooper());
     final Runnable runnable = new Runnable() {
         public void run() {
@@ -108,12 +134,23 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     private Timer recordTimer = null;
     private int seconds = 0;
     private boolean isVRMode = false;
+    // Which view the main video is rendered into. SurfaceView is the low latency
+    // default; the TextureView is only used when object detection needs getBitmap().
+    private boolean videoUsesTextureView = false;
     private ConstraintLayout constraintLayout;
     private ConstraintSet constraintSet;
     private WfbNgLink wfbLink;
 
+    private ObjectDetectorHelper objectDetectorHelper;
+    private ExecutorService objectDetectionExecutor;
+    private volatile boolean isObjectDetectionEnabled = false;
+    private volatile boolean isDetecting = false;
+    private final Object detectorLock = new Object();
+    private Boolean objectDetectionRuntimeSupported = null;
+
     private static final String PREF_DRONE_USERNAME = "drone_username";
     private static final String PREF_DRONE_PASSWORD = "drone_password";
+    private static final String PREF_DVR_FILENAME = "dvr_filename";
 
     public boolean getVRSetting() {
         return getSharedPreferences("general", Context.MODE_PRIVATE).getBoolean("vr-mode", false);
@@ -131,13 +168,36 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                 Context.MODE_PRIVATE).getInt("wifi-channel", 161);
     }
 
+    public static boolean getLowLatencySetting(Context context) {
+        return context.getSharedPreferences("general",
+                Context.MODE_PRIVATE).getBoolean("low_latency_decoder", true);
+    }
+
     public static int getBandwidth(Context context) {
         return context.getSharedPreferences("general",
                 Context.MODE_PRIVATE).getInt("bandwidth", 20);
     }
 
-    public static String wirelessInfo() {
-        int address = wifiManager.getConnectionInfo().getIpAddress();
+    /**
+     * IPv4 address on the device's own wifi, used to tell the user where to push a stream
+     * when no adapter is attached. Returns null when there is nothing to report.
+     *
+     * <p>Takes a Context rather than reading a static WifiManager that only
+     * {@link #initializeUI()} assigns: any other caller - or this one before onCreate has got
+     * that far - hits a NullPointerException, and this is called from
+     * WfbLinkManager.refreshAdapters().
+     */
+    public static String wirelessInfo(Context context) {
+        WifiManager manager =
+                (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (manager == null) {
+            return null;
+        }
+        WifiInfo info = manager.getConnectionInfo();
+        if (info == null) {
+            return null;
+        }
+        int address = info.getIpAddress();
         return (address == 0) ? null : Formatter.formatIpAddress(address);
     }
 
@@ -163,6 +223,10 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     }
 
     private void resetApp() {
+        // Finalize an active recording first. System.exit() below skips every lifecycle
+        // callback, and the MP4 is only closed when the DVR thread exits; stopDvr() joins
+        // it. No-op when nothing is recording.
+        stopDvr();
         // Restart the app
         Intent intent = getPackageManager().getLaunchIntentForPackage(getPackageName());
         if (intent != null) {
@@ -290,7 +354,6 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
 
-        wifiManager = (WifiManager) getSystemService(WIFI_SERVICE);
     }
 
     // ----------------------------------------------------------------------------
@@ -319,6 +382,7 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     private void initializeVideoPlayers() {
         videoPlayer = new VideoPlayer(this);
         videoPlayer.setIVideoParamsChanged(this);
+        videoPlayer.setLowLatency(getLowLatencySetting(this));
 
         isVRMode = getVRSetting();
 
@@ -334,6 +398,7 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
      */
     private void setupVRVideoPlayers() {
         binding.mainVideo.setVisibility(View.GONE);
+        binding.mainVideoSurface.setVisibility(View.GONE);
         binding.surfaceViewLeft.getHolder().addCallback(videoPlayer.configure1(0));
         binding.surfaceViewRight.getHolder().addCallback(videoPlayer.configure1(1));
     }
@@ -344,7 +409,30 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     private void setupStandardVideoPlayer() {
         binding.surfaceViewRight.setVisibility(View.GONE);
         binding.surfaceViewLeft.setVisibility(View.GONE);
-        binding.mainVideo.getHolder().addCallback(videoPlayer.configure1(0));
+
+        // Object detection reads frames back with TextureView.getBitmap(), which forces
+        // the video through the view hierarchy's GPU composition. Without it a
+        // SurfaceView is used so the video stays on a hardware overlay plane.
+        //
+        // The preference alone is not enough: setObjectDetectionEnabled() turns detection
+        // back off in onResume when the runtime or the selected model is missing, and returns
+        // before the renderer swap - which would leave the session on the TextureView with
+        // nothing reading from it. Both checks are cheap when od_enabled is false, and when
+        // it is true the runtime check only loads a library that is about to be used anyway.
+        videoUsesTextureView = getSharedPreferences("general", MODE_PRIVATE)
+                        .getBoolean("od_enabled", false)
+                && isObjectDetectionRuntimeSupported()
+                && isSelectedObjectDetectionModelAvailable();
+
+        if (videoUsesTextureView) {
+            binding.mainVideoSurface.setVisibility(View.GONE);
+            binding.mainVideo.setVisibility(View.VISIBLE);
+            binding.mainVideo.setSurfaceTextureListener(videoPlayer.configureTextureView(0));
+        } else {
+            binding.mainVideo.setVisibility(View.GONE);
+            binding.mainVideoSurface.setVisibility(View.VISIBLE);
+            binding.mainVideoSurface.getHolder().addCallback(videoPlayer.configure1(0));
+        }
     }
 
     // ----------------------------------------------------------------------------
@@ -553,6 +641,9 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         // Bandwidth submenu
         setupBandwidthSubMenu(popup);
 
+        // Video submenu
+        setupVideoSubMenu(popup);
+
         // OSD submenu
         setupOSDSubMenu(popup);
 
@@ -573,6 +664,9 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
 
         // Help submenu
         setupHelpSubMenu(popup);
+
+        // Object Detection submenu
+        setupObjectDetectionSubMenu(popup);
 
         popup.show();
     }
@@ -632,6 +726,37 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                 return true;
             });
         }
+    }
+
+    /**
+     * Submenu for video decoder options.
+     * "Low latency" sets the MediaCodec low-latency and realtime-priority keys. It is on
+     * by default; decoders that misbehave with those keys can be put back on the stock
+     * pipeline here.
+     *
+     * The keys are only applied when the codec is configured, and the codec is only torn
+     * down when its surface goes away, not on a channel change or on VideoPlayer
+     * stop()/start(). So the toggle restarts the app, the same way the VR mode toggle
+     * does, instead of promising an "on next video start" that never comes.
+     */
+    private void setupVideoSubMenu(PopupMenu popup) {
+        SubMenu videoMenu = popup.getMenu().addSubMenu("Video");
+
+        MenuItem lowLatencyItem = videoMenu.add("Low latency");
+        lowLatencyItem.setCheckable(true);
+        lowLatencyItem.setChecked(getLowLatencySetting(this));
+        lowLatencyItem.setOnMenuItemClickListener(item -> {
+            boolean enabled = !item.isChecked();
+            item.setChecked(enabled);
+            // commit(), not apply(): resetApp() ends the process with System.exit()
+            // before an asynchronous write would be flushed.
+            getSharedPreferences("general", MODE_PRIVATE).edit()
+                    .putBoolean("low_latency_decoder", enabled).commit();
+            item.setShowAsAction(MenuItem.SHOW_AS_ACTION_COLLAPSE_ACTION_VIEW);
+            item.setActionView(new View(this));
+            resetApp();
+            return false;
+        });
     }
 
     /**
@@ -900,6 +1025,12 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         MenuItem resetPermissions = recording.add("Reset DVR folder");
         resetPermissions.setOnMenuItemClickListener(item -> {
             resetFolderPermissions();
+            return true;
+        });
+
+        MenuItem editFileNameTemplate = recording.add("File Name Template");
+        editFileNameTemplate.setOnMenuItemClickListener(item -> {
+            showEditFileNameTemplateDialog();
             return true;
         });
     }
@@ -1180,10 +1311,7 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         DocumentFile pickedDir = DocumentFile.fromTreeUri(this, uri);
         if (pickedDir != null && pickedDir.canWrite()) {
             LocalDateTime now = LocalDateTime.now();
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmm");
-            // Format the current date and time
-            String formattedNow = now.format(formatter);
-            String filename = "pixelpilot_" + formattedNow + ".mp4";
+            String filename = getDvrFileName(getDvrFileNameTemplate(), now) + ".mp4";
             DocumentFile newFile = pickedDir.createFile("video/mp4", filename);
             Toast.makeText(this, "Recording to " + filename, Toast.LENGTH_SHORT).show();
             if (newFile == null)
@@ -1317,6 +1445,10 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                     startDvr(dvrUri);
                 }
             }
+        } else if (requestCode == PICK_MODEL_REQUEST_CODE && resultCode == RESULT_OK) {
+            if (data != null && data.getData() != null) {
+                handleSelectedModelUri(data);
+            }
         } else if (requestCode == 100) {  // VPN_REQUEST_CODE is 100
             if (resultCode == RESULT_OK) {
                 // VPN permission granted, start the VPN service
@@ -1407,6 +1539,8 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     protected void onPause() {
         super.onPause();
 
+        stopObjectDetectionLoop();
+
         unregisterReceivers();
 
         videoPlayer.stop();
@@ -1445,6 +1579,10 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         videoPlayer.start();
         updateUdpForwardingState();
         videoPlayer.startAudio();
+
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        boolean odEnabled = prefs.getBoolean("od_enabled", false);
+        setObjectDetectionEnabled(odEnabled);
 
         osdManager.restoreOSDConfig();
 
@@ -1491,6 +1629,7 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         Log.d(TAG, "Set resolution: " + videoW + "x" + videoH);
 
         updateViewRatio(R.id.mainVideo, lastVideoW, lastVideoH);
+        updateViewRatio(R.id.mainVideoSurface, lastVideoW, lastVideoH);
         updateViewRatio(R.id.surfaceViewLeft, lastVideoW, lastVideoH);
         updateViewRatio(R.id.surfaceViewRight, lastVideoW, lastVideoH);
     }
@@ -1679,10 +1818,81 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                 .show();
     }
 
+    private void showEditFileNameTemplateDialog() {
+        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+        layout.setPadding(50, 30, 50, 30); // Add some padding around the content
+
+        // EditText for filename
+        final android.widget.EditText fileNameEditText = new android.widget.EditText(this);
+        fileNameEditText.setHint("pixelpilot_[yyyyMMdd-HHmmss]");
+        fileNameEditText.setText(getDvrFileNameTemplate()); // Pre-fill with current saved filename template
+        layout.addView(fileNameEditText);
+
+        // TextView for preview filename
+        final android.widget.TextView previewTextView = new android.widget.TextView(this);
+        previewTextView.setText(getDvrFileName(getDvrFileNameTemplate(), LocalDateTime.now()) + ".mp4");
+        layout.addView(previewTextView);
+
+        // Set a listener for EditText
+        fileNameEditText.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence charSequence, int i, int i1, int i2) {}
+
+            @Override
+            public void onTextChanged(CharSequence charSequence, int i, int i1, int i2) {
+                previewTextView.setText(getDvrFileName(fileNameEditText.getText().toString(), LocalDateTime.now()) + ".mp4");
+            }
+
+            @Override
+            public void afterTextChanged(Editable editable) {}
+        });
+
+        // Build and show the AlertDialog
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("DVR File Name Template")
+                .setView(layout) // Set our custom layout
+                .setPositiveButton("Save", (dialog, which) -> {
+                    // Save the new values to SharedPreferences
+                    setDvrFileName(fileNameEditText.getText().toString());
+                    Toast.makeText(this, "DVR file name template saved.", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancel", (dialog, which) -> {
+                    dialog.cancel(); // Dismiss the dialog
+                })
+                .show();
+    }
+
+    // pixelpilot_[yyyyMMdd-HHmmss]
+    // ".mp4" will append later
+    private String getDvrFileName(String template, LocalDateTime time) {
+        Matcher matcher = Pattern.compile("\\[([^\\]]*)\\]").matcher(template);
+        String fallbackTime = time.format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+
+        if (matcher.find()) {
+            String prefix = template.substring(0, matcher.start());
+            String pattern = matcher.group(1);
+            String suffix = template.substring(matcher.end());
+
+            try {
+                String timePart = time.format(DateTimeFormatter.ofPattern(pattern));
+                return prefix + timePart + suffix;
+            } catch (IllegalArgumentException e) {
+                return prefix + fallbackTime + suffix;
+            }
+        }
+        return "pixelpilot_" + fallbackTime;
+    }
+
     // Helper method to retrieve the drone username
     // Provides a default "root" if not yet set, for initial compatibility.
     private String getDroneUsername() {
         return getSharedPreferences("general", Context.MODE_PRIVATE).getString(PREF_DRONE_USERNAME, "root");
+    }
+
+    private String getDvrFileNameTemplate()
+    {
+        return getSharedPreferences("general", Context.MODE_PRIVATE).getString(PREF_DVR_FILENAME, "pixelpilot_[yyyyMMdd-HHmmss]");
     }
 
     // Helper method to save the drone username
@@ -1690,6 +1900,13 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         SharedPreferences prefs = getSharedPreferences("general", Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = prefs.edit();
         editor.putString(PREF_DRONE_USERNAME, username);
+        editor.apply();
+    }
+
+    private void setDvrFileName(String fileName) {
+        SharedPreferences prefs = getSharedPreferences("general", Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = prefs.edit();
+        editor.putString(PREF_DVR_FILENAME, fileName);
         editor.apply();
     }
 
@@ -1736,5 +1953,480 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                 handler.proceed(username, password);
             }
         });
+    }
+
+    private void setupObjectDetectionSubMenu(PopupMenu popup) {
+        SubMenu odMenu = popup.getMenu().addSubMenu("Object Detection");
+
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        boolean odEnabled = prefs.getBoolean("od_enabled", false);
+        boolean runtimeSupported = isObjectDetectionRuntimeSupported();
+        boolean selectedModelAvailable = isSelectedObjectDetectionModelAvailable();
+        String status = getObjectDetectionStatus(runtimeSupported, selectedModelAvailable);
+
+        MenuItem statusItem = odMenu.add(status);
+        statusItem.setEnabled(false);
+
+        MenuItem enableItem = odMenu.add("Enable");
+        enableItem.setCheckable(true);
+        enableItem.setEnabled(runtimeSupported && selectedModelAvailable);
+        enableItem.setChecked(odEnabled && runtimeSupported && selectedModelAvailable);
+        enableItem.setOnMenuItemClickListener(item -> {
+            boolean newState = !item.isChecked();
+            item.setChecked(newState);
+            setObjectDetectionEnabled(newState);
+            return true;
+        });
+
+        SubMenu delegateMenu = odMenu.addSubMenu("Processing Unit");
+        int savedDelegate = prefs.getInt("od_delegate", ObjectDetectorHelper.DELEGATE_CPU);
+
+        MenuItem cpuItem = delegateMenu.add("CPU");
+        cpuItem.setEnabled(runtimeSupported);
+        cpuItem.setCheckable(true);
+        cpuItem.setChecked(savedDelegate == ObjectDetectorHelper.DELEGATE_CPU);
+        cpuItem.setOnMenuItemClickListener(item -> {
+            prefs.edit().putInt("od_delegate", ObjectDetectorHelper.DELEGATE_CPU).apply();
+            restartObjectDetector();
+            return true;
+        });
+
+        MenuItem gpuItem = delegateMenu.add("GPU");
+        gpuItem.setEnabled(runtimeSupported && isGpuDelegateSupported());
+        gpuItem.setCheckable(true);
+        gpuItem.setChecked(savedDelegate == ObjectDetectorHelper.DELEGATE_GPU);
+        gpuItem.setOnMenuItemClickListener(item -> {
+            prefs.edit().putInt("od_delegate", ObjectDetectorHelper.DELEGATE_GPU).apply();
+            restartObjectDetector();
+            return true;
+        });
+
+        SubMenu modelMenu = odMenu.addSubMenu("Model");
+        int savedModel = prefs.getInt("od_model", ObjectDetectorHelper.MODEL_EFFICIENTDETV0);
+
+        MenuItem downloadItem = modelMenu.add("Download Default models");
+        downloadItem.setEnabled(runtimeSupported);
+        downloadItem.setOnMenuItemClickListener(item -> {
+            downloadObjectDetectionModels();
+            return true;
+        });
+
+        MenuItem v0Item = modelMenu.add("EfficientDet-Lite0");
+        v0Item.setEnabled(runtimeSupported && isDownloadedModelAvailable(ObjectDetectorHelper.MODEL_EFFICIENTDETV0));
+        v0Item.setCheckable(true);
+        v0Item.setChecked(savedModel == ObjectDetectorHelper.MODEL_EFFICIENTDETV0);
+        v0Item.setOnMenuItemClickListener(item -> {
+            prefs.edit().putInt("od_model", ObjectDetectorHelper.MODEL_EFFICIENTDETV0).apply();
+            restartObjectDetector();
+            return true;
+        });
+
+        MenuItem v2Item = modelMenu.add("EfficientDet-Lite2");
+        v2Item.setEnabled(runtimeSupported && isDownloadedModelAvailable(ObjectDetectorHelper.MODEL_EFFICIENTDETV2));
+        v2Item.setCheckable(true);
+        v2Item.setChecked(savedModel == ObjectDetectorHelper.MODEL_EFFICIENTDETV2);
+        v2Item.setOnMenuItemClickListener(item -> {
+            prefs.edit().putInt("od_model", ObjectDetectorHelper.MODEL_EFFICIENTDETV2).apply();
+            restartObjectDetector();
+            return true;
+        });
+
+        MenuItem selectLocalItem = modelMenu.add("Select local model");
+        selectLocalItem.setEnabled(runtimeSupported);
+        selectLocalItem.setOnMenuItemClickListener(item -> {
+            selectLocalObjectDetectionModel();
+            return true;
+        });
+
+        if (isCustomModelAvailable()) {
+            String customModelName = prefs.getString(PREF_OD_CUSTOM_MODEL_NAME, "Local model");
+            MenuItem customItem = modelMenu.add(customModelName);
+            customItem.setEnabled(runtimeSupported);
+            customItem.setCheckable(true);
+            customItem.setChecked(savedModel == ObjectDetectorHelper.MODEL_CUSTOM);
+            customItem.setOnMenuItemClickListener(item -> {
+                prefs.edit().putInt("od_model", ObjectDetectorHelper.MODEL_CUSTOM).apply();
+                restartObjectDetector();
+                return true;
+            });
+        }
+
+ 
+    }
+
+    private void setObjectDetectionEnabled(boolean enabled) {
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        if (enabled) {
+            boolean runtimeSupported = isObjectDetectionRuntimeSupported();
+            boolean modelAvailable = isSelectedObjectDetectionModelAvailable();
+            if (!runtimeSupported || !modelAvailable) {
+                isObjectDetectionEnabled = false;
+                prefs.edit().putBoolean("od_enabled", false).apply();
+                binding.detectionOverlay.setVisibility(View.GONE);
+                binding.detectionOverlay.clear();
+                stopObjectDetectionLoop();
+                Toast.makeText(this, getObjectDetectionStatus(runtimeSupported, modelAvailable), Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
+
+        isObjectDetectionEnabled = enabled;
+        // commit(), not apply(): the restart below ends the process with System.exit()
+        // before an asynchronous write would be flushed, and the renderer picked on the
+        // next launch is read from exactly this value.
+        prefs.edit().putBoolean("od_enabled", enabled).commit();
+
+        // Enabling / disabling detection swaps the main video renderer. Handing the
+        // decoder a different surface at runtime would need the receiver lifecycle in
+        // VideoPlayer reworked, so restart instead - same as the VR mode toggle does.
+        if (!isVRMode && enabled != videoUsesTextureView) {
+            Toast.makeText(this, "Restarting to switch video renderer...", Toast.LENGTH_SHORT).show();
+            resetApp();
+            return;
+        }
+
+        if (enabled) {
+            binding.detectionOverlay.setVisibility(View.VISIBLE);
+            startObjectDetectionLoop();
+        } else {
+            binding.detectionOverlay.setVisibility(View.GONE);
+            binding.detectionOverlay.clear();
+            stopObjectDetectionLoop();
+        }
+    }
+
+    private void restartObjectDetector() {
+        if (isObjectDetectionEnabled) {
+            stopObjectDetectionLoop();
+            startObjectDetectionLoop();
+        }
+    }
+
+    private void startObjectDetectionLoop() {
+        if (isVRMode) return; // Standard mode only
+        if (!videoUsesTextureView) return; // getBitmap() needs the TextureView renderer
+        if (objectDetectionExecutor == null) {
+            objectDetectionExecutor = Executors.newSingleThreadExecutor();
+        }
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        int delegate = prefs.getInt("od_delegate", ObjectDetectorHelper.DELEGATE_CPU);
+        if (delegate == ObjectDetectorHelper.DELEGATE_GPU && !isGpuDelegateSupported()) {
+            delegate = ObjectDetectorHelper.DELEGATE_CPU;
+            prefs.edit().putInt("od_delegate", ObjectDetectorHelper.DELEGATE_CPU).apply();
+        }
+        final int detectorDelegate = delegate;
+
+        objectDetectionExecutor.execute(() -> {
+            ByteBuffer modelBuffer = readSelectedObjectDetectionModel();
+            if (modelBuffer == null) {
+                runOnUiThread(() -> setObjectDetectionEnabled(false));
+                return;
+            }
+
+            synchronized (detectorLock) {
+                if (objectDetectorHelper != null) {
+                    objectDetectorHelper.clear();
+                }
+                objectDetectorHelper = new ObjectDetectorHelper(
+                        VideoActivity.this,
+                        0.5f,
+                        3,
+                        detectorDelegate,
+                        modelBuffer
+                );
+            }
+
+            isDetecting = true;
+            while (isDetecting && isObjectDetectionEnabled) {
+                Bitmap bitmap = null;
+                try {
+                    long start = SystemClock.uptimeMillis();
+                    if (binding.mainVideo != null && binding.mainVideo.isAvailable()) {
+                        bitmap = binding.mainVideo.getBitmap();
+                    }
+
+                    if (bitmap != null) {
+                        ObjectDetectorHelper.ResultBundle result = null;
+                        synchronized (detectorLock) {
+                            if (objectDetectorHelper != null) {
+                                result = objectDetectorHelper.detectImage(bitmap);
+                            }
+                        }
+                        
+                        if (result != null && !result.results.isEmpty() && isObjectDetectionEnabled) {
+                            final ObjectDetectorHelper.ResultBundle finalResult = result;
+                            runOnUiThread(() -> {
+                                if (isObjectDetectionEnabled) {
+                                    binding.detectionOverlay.setResults(finalResult.results.get(0), finalResult.inputImageHeight, finalResult.inputImageWidth);
+                                }
+                            });
+                        } else {
+                            runOnUiThread(() -> {
+                                if (isObjectDetectionEnabled) {
+                                    binding.detectionOverlay.clear();
+                                }
+                            });
+                        }
+                    }
+
+                    long sleepTime = 100 - (SystemClock.uptimeMillis() - start); // ~10 FPS
+                    if (sleepTime > 0) {
+                        Thread.sleep(sleepTime);
+                    }
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    Log.e(TAG, "Error in detection loop", e);
+                } finally {
+                    if (bitmap != null) {
+                        bitmap.recycle();
+                    }
+                }
+            }
+        });
+    }
+
+    private void stopObjectDetectionLoop() {
+        isDetecting = false;
+        if (objectDetectionExecutor != null) {
+            objectDetectionExecutor.shutdownNow();
+            objectDetectionExecutor = null;
+        }
+        synchronized (detectorLock) {
+            if (objectDetectorHelper != null) {
+                objectDetectorHelper.clear();
+                objectDetectorHelper = null;
+            }
+        }
+    }
+
+    private File getObjectDetectionModelsDir() {
+        File modelsDir = new File(getFilesDir(), "models");
+        if (!modelsDir.exists() && !modelsDir.mkdirs()) {
+            Log.e(TAG, "Failed to create object detection models directory " + modelsDir);
+        }
+        return modelsDir;
+    }
+
+    private File getDownloadedModelFile(int model) {
+        String fileName = model == ObjectDetectorHelper.MODEL_EFFICIENTDETV2 ? MODEL_LITE2_FILE : MODEL_LITE0_FILE;
+        return new File(getObjectDetectionModelsDir(), fileName);
+    }
+
+    private boolean isDownloadedModelAvailable(int model) {
+        File file = getDownloadedModelFile(model);
+        long expectedBytes = model == ObjectDetectorHelper.MODEL_EFFICIENTDETV2 ? MODEL_LITE2_BYTES : MODEL_LITE0_BYTES;
+        return file.isFile() && file.length() == expectedBytes;
+    }
+
+    private boolean isCustomModelAvailable() {
+        String uriString = getSharedPreferences("general", MODE_PRIVATE).getString(PREF_OD_CUSTOM_MODEL_URI, null);
+        if (uriString == null) {
+            return false;
+        }
+        try (InputStream inputStream = getContentResolver().openInputStream(Uri.parse(uriString))) {
+            return inputStream != null;
+        } catch (Exception e) {
+            Log.e(TAG, "Custom object detection model is not available", e);
+            return false;
+        }
+    }
+
+    private boolean isSelectedObjectDetectionModelAvailable() {
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        int model = prefs.getInt("od_model", ObjectDetectorHelper.MODEL_EFFICIENTDETV0);
+        if (model == ObjectDetectorHelper.MODEL_CUSTOM) {
+            return isCustomModelAvailable();
+        }
+        return isDownloadedModelAvailable(model);
+    }
+
+    private String getObjectDetectionStatus(boolean runtimeSupported, boolean selectedModelAvailable) {
+        if (!runtimeSupported) {
+            return "Unavailable: device is not supported";
+        }
+        if (!selectedModelAvailable) {
+            return "Unavailable: model not installed";
+        }
+        return "Ready";
+    }
+
+    private boolean isObjectDetectionRuntimeSupported() {
+        if (objectDetectionRuntimeSupported != null) {
+            return objectDetectionRuntimeSupported;
+        }
+        if (!isObjectDetectionAbiSupported()) {
+            objectDetectionRuntimeSupported = false;
+            return false;
+        }
+        try {
+            Class.forName("com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector");
+            System.loadLibrary("mediapipe_tasks_vision_jni");
+            objectDetectionRuntimeSupported = true;
+            return true;
+        } catch (Throwable e) {
+            Log.e(TAG, "Object detection runtime is not available", e);
+            objectDetectionRuntimeSupported = false;
+            return false;
+        }
+    }
+
+    private boolean isObjectDetectionAbiSupported() {
+        return Arrays.asList(Build.SUPPORTED_64_BIT_ABIS).contains("arm64-v8a");
+    }
+
+    private boolean isGpuDelegateSupported() {
+        ActivityManager activityManager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        if (activityManager == null || activityManager.getDeviceConfigurationInfo() == null) {
+            return false;
+        }
+        return activityManager.getDeviceConfigurationInfo().reqGlEsVersion >= 0x00030001;
+    }
+
+    private void downloadObjectDetectionModels() {
+        Toast.makeText(this, "Downloading object detection models...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            try {
+                downloadObjectDetectionModel(ObjectDetectorHelper.MODEL_EFFICIENTDETV0);
+                downloadObjectDetectionModel(ObjectDetectorHelper.MODEL_EFFICIENTDETV2);
+                if (!isSelectedObjectDetectionModelAvailable()) {
+                    getSharedPreferences("general", MODE_PRIVATE)
+                            .edit()
+                            .putInt("od_model", ObjectDetectorHelper.MODEL_EFFICIENTDETV0)
+                            .apply();
+                }
+                runOnUiThread(() -> Toast.makeText(this, "Object detection models downloaded", Toast.LENGTH_LONG).show());
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to download object detection models", e);
+                runOnUiThread(() -> Toast.makeText(this, "Failed to download models: " + e.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        }).start();
+    }
+
+    private void downloadObjectDetectionModel(int model) throws IOException {
+        File target = getDownloadedModelFile(model);
+        long expectedBytes = model == ObjectDetectorHelper.MODEL_EFFICIENTDETV2 ? MODEL_LITE2_BYTES : MODEL_LITE0_BYTES;
+        if (target.isFile() && target.length() == expectedBytes) {
+            return;
+        }
+
+        String modelUrl = model == ObjectDetectorHelper.MODEL_EFFICIENTDETV2 ? MODEL_LITE2_URL : MODEL_LITE0_URL;
+        File tempFile = new File(target.getParentFile(), target.getName() + ".download");
+        HttpURLConnection connection = (HttpURLConnection) new URL(modelUrl).openConnection();
+        connection.setConnectTimeout(15000);
+        connection.setReadTimeout(60000);
+        connection.connect();
+        int responseCode = connection.getResponseCode();
+        if (responseCode < 200 || responseCode >= 300) {
+            throw new IOException("HTTP " + responseCode);
+        }
+
+        long bytesCopied = 0;
+        try (InputStream inputStream = connection.getInputStream();
+             OutputStream outputStream = new FileOutputStream(tempFile)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = inputStream.read(buffer)) != -1) {
+                outputStream.write(buffer, 0, read);
+                bytesCopied += read;
+            }
+        } finally {
+            connection.disconnect();
+        }
+
+        if (bytesCopied != expectedBytes) {
+            if (!tempFile.delete()) {
+                Log.w(TAG, "Failed to delete incomplete model " + tempFile);
+            }
+            throw new IOException("Incomplete model download");
+        }
+        if (target.exists() && !target.delete()) {
+            throw new IOException("Failed to replace existing model");
+        }
+        if (!tempFile.renameTo(target)) {
+            throw new IOException("Failed to save model");
+        }
+    }
+
+    private void selectLocalObjectDetectionModel() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/octet-stream", "application/x-tflite"});
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, PICK_MODEL_REQUEST_CODE);
+    }
+
+    private void handleSelectedModelUri(Intent data) {
+        Uri uri = data.getData();
+        if (uri == null) {
+            return;
+        }
+        String displayName = "Local model";
+        DocumentFile documentFile = DocumentFile.fromSingleUri(this, uri);
+        if (documentFile != null && documentFile.getName() != null) {
+            displayName = documentFile.getName();
+        }
+        if (!displayName.toLowerCase(Locale.US).endsWith(".tflite")) {
+            Toast.makeText(this, "Please select a .tflite model file", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        try (InputStream inputStream = getContentResolver().openInputStream(uri)) {
+            if (inputStream == null) {
+                throw new IOException("Unable to open model file");
+            }
+            final int takeFlags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+            getContentResolver().takePersistableUriPermission(uri, takeFlags);
+            SharedPreferences.Editor editor = getSharedPreferences("general", MODE_PRIVATE).edit();
+            editor.putString(PREF_OD_CUSTOM_MODEL_URI, uri.toString());
+            editor.putString(PREF_OD_CUSTOM_MODEL_NAME, displayName);
+            editor.putInt("od_model", ObjectDetectorHelper.MODEL_CUSTOM);
+            editor.apply();
+            Toast.makeText(this, "Selected " + displayName, Toast.LENGTH_LONG).show();
+            restartObjectDetector();
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to select local object detection model", e);
+            Toast.makeText(this, "Failed to select model: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private ByteBuffer readSelectedObjectDetectionModel() {
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        int model = prefs.getInt("od_model", ObjectDetectorHelper.MODEL_EFFICIENTDETV0);
+        try {
+            if (model == ObjectDetectorHelper.MODEL_CUSTOM) {
+                String uriString = prefs.getString(PREF_OD_CUSTOM_MODEL_URI, null);
+                if (uriString == null) {
+                    return null;
+                }
+                try (InputStream inputStream = getContentResolver().openInputStream(Uri.parse(uriString))) {
+                    return readModelBuffer(inputStream);
+                }
+            }
+            try (InputStream inputStream = new FileInputStream(getDownloadedModelFile(model))) {
+                return readModelBuffer(inputStream);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to read object detection model", e);
+            return null;
+        }
+    }
+
+    private ByteBuffer readModelBuffer(InputStream inputStream) throws IOException {
+        if (inputStream == null) {
+            throw new IOException("Model input stream is null");
+        }
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while ((read = inputStream.read(buffer)) != -1) {
+            outputStream.write(buffer, 0, read);
+        }
+        byte[] bytes = outputStream.toByteArray();
+        ByteBuffer directBuffer = ByteBuffer.allocateDirect(bytes.length);
+        directBuffer.put(bytes);
+        directBuffer.rewind();
+        return directBuffer;
     }
 }
